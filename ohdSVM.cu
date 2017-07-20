@@ -1,3 +1,4 @@
+//#define JDS_PERMK
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -40,6 +41,9 @@
 namespace ohdSVM
 {
 #include "dev_vars.h"
+	static bool g_useEllRT = false;
+	static int g_sliceSize = 0;
+	static int g_threadsPerRow = 0;
 }
 
 using namespace ohdSVM;
@@ -112,6 +116,14 @@ __global__ static void kernelUpdateG(float * y, float * g, const float * alphadi
     }
 }
 
+__global__ static void kernelReorderAlphas(float * dst, const float * src, const unsigned int * rowPerm, int num_vec)
+{
+	for (int k = blockDim.x * blockIdx.x + threadIdx.x; k < num_vec; k += gridDim.x * blockDim.x)
+	{
+		dst[rowPerm[k]] = src[k];
+	}
+}
+
 template<unsigned int WS>
 static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & x, const float * y, size_t num_vec, size_t num_vec_aligned, size_t dim, size_t dim_aligned, float C, float gamma, float eps)
 {
@@ -150,6 +162,7 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
 #endif
     csr_gpu sparse_data_gpu;
     jds_gpu jds_data_gpu;
+	ellrt_gpu ellrt_data_gpu;
     cublasHandle_t cublas;
     try
     {
@@ -179,10 +192,23 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
         if (sparse)
         {
             makeCudaCsr(sparse_data_gpu, *x.sparse);
-            makeCudaJds(jds_data_gpu, *x.sparse);
+			if (g_useEllRT)
+			{
+				if (g_sliceSize <= 0)
+					g_sliceSize = 128;
+				if (g_threadsPerRow <= 0)
+					g_threadsPerRow = std::min(32, 1 << (int)round(log2(x.sparse->nnz / (float)num_vec)));
+				std::cout << "Storing sparse data to EllR-T format with: sliceSize = " << g_sliceSize << ", threadsPerRow = " << g_threadsPerRow << std::endl;
+				makeCudaEllrt(ellrt_data_gpu, *x.sparse, g_sliceSize, g_threadsPerRow);
+			}
+			else
+				makeCudaJds(jds_data_gpu, *x.sparse);
             assert_cuda(cudaMalloc(&d_denseVec, dim_aligned * WS * sizeof(float)));
             std::cout << "Precalculating X2" << std::endl;
-            computeX2Sparse(d_x2, jds_data_gpu, num_vec);
+			if (g_useEllRT)
+				computeX2Sparse(d_x2, ellrt_data_gpu, num_vec);
+			else
+				computeX2Sparse(d_x2, jds_data_gpu, num_vec);
         }
         else
         {
@@ -299,7 +325,7 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
 #ifndef CALC_KLOCAL
             if (sparse)
             {
-                ACCUMULATE_KERNEL_TIME(timer_check_cache, counter_check_cache, (checkCache<findCacheRowBlockSize, WS, ELEM_PER_THREAD>(sparse, d_workingset, d_x, d_x2, sparse_data_gpu, jds_data_gpu, d_K, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, d_denseVec, num_vec_shrunk, num_vec_aligned, dim, dim_aligned, cache_rows, gamma)));
+				ACCUMULATE_KERNEL_TIME(timer_check_cache, counter_check_cache, (checkCache<findCacheRowBlockSize, WS, ELEM_PER_THREAD>(sparse, d_workingset, d_x, d_x2, sparse_data_gpu, jds_data_gpu, ellrt_data_gpu, d_K, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, d_denseVec, num_vec_shrunk, num_vec_aligned, dim, dim_aligned, cache_rows, gamma)));
             }
             else
             {
@@ -337,7 +363,7 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
 #ifdef CALC_KLOCAL
             if (sparse)
             {
-                ACCUMULATE_KERNEL_TIME(timer_check_cache, counter_check_cache, (checkCacheKLocal<findCacheRowBlockSize, WS, ELEM_PER_THREAD>(sparse, d_workingset, d_x, d_x2, sparse_data_gpu, jds_data_gpu, d_K, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, d_alphadiff, d_denseVec, num_vec_shrunk, num_vec_aligned, dim, dim_aligned, cache_rows, gamma)));
+                ACCUMULATE_KERNEL_TIME(timer_check_cache, counter_check_cache, (checkCacheKLocal<findCacheRowBlockSize, WS, ELEM_PER_THREAD>(sparse, d_workingset, d_x, d_x2, sparse_data_gpu, jds_data_gpu, ellrt_data_gpu, d_K, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, d_alphadiff, d_denseVec, num_vec_shrunk, num_vec_aligned, dim, dim_aligned, cache_rows, gamma)));
             }
             else
             {
@@ -394,12 +420,26 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
             + timer_Gupdate) << " ms\n";
 #endif
 
+#ifdef JDS_PERMK
+		{
+			float * d_alphaReordered;
+			assert_cuda(cudaMalloc(&d_alphaReordered, num_vec * sizeof(float)));
+			dim3 dimBlock(256);
+			dim3 dimGrid(std::min(1024, getgriddim<int>(num_vec, dimBlock.x)));
+			kernelReorderAlphas << <dimGrid, dimBlock >> > (d_alphaReordered, d_alpha, jds_data_gpu.rowPerm, num_vec);
+			assert_cuda(cudaMemcpy(alpha, d_alphaReordered, num_vec * sizeof(float), cudaMemcpyDeviceToHost));
+		}
+#else
         assert_cuda(cudaMemcpy(alpha, d_alpha, num_vec * sizeof(float), cudaMemcpyDeviceToHost));
+#endif
 
         if (sparse)
         {
             freeCudaCsr(sparse_data_gpu);
-            freeCudaJds(jds_data_gpu);
+			if (g_useEllRT)
+				freeCudaEllrt(ellrt_data_gpu);
+			else
+				freeCudaJds(jds_data_gpu);
             assert_cuda(cudaFree(d_denseVec));
         }
         else
@@ -436,7 +476,10 @@ static void train(float * alpha, float * rho, bool sparse, const ohdSVM::Data & 
         if (sparse)
         {
             freeCudaCsr(sparse_data_gpu);
-            freeCudaJds(jds_data_gpu);
+			if (g_useEllRT)
+				freeCudaEllrt(ellrt_data_gpu);
+			else
+				freeCudaJds(jds_data_gpu);
             cudaFree(d_denseVec);
         }
         else
@@ -504,4 +547,11 @@ bool ohdSVM::Train(float * alpha, float * rho, bool sparse, const Data & x, cons
             std::cerr << "Try lowering working set size\n";
     }
 	return false;
+}
+
+void ohdSVM::useEllRT(bool use, int sliceSize, int threadsPerRow)
+{
+	g_useEllRT = use;
+	g_sliceSize = sliceSize;
+	g_threadsPerRow = threadsPerRow;
 }

@@ -19,6 +19,24 @@ __global__ static void kernelMakeDenseVecWS(const int * KCacheRowIdx, csr_gpu x,
     }
 }
 
+template<unsigned int WS>
+__global__ static void kernelMakeDenseVecWSPerm(const int * KCacheRowIdx, csr_gpu x, const unsigned int * rowPerm, float * vec, int dim_aligned)
+{
+	if (d_num_cache_rows_to_compute <= blockIdx.y)
+		return;
+	int row = d_cache_rows_to_compute[blockIdx.y];
+	int i = KCacheRowIdx[row];
+	int permI = rowPerm[i];
+
+	int j = x.rowOffsets[permI] + blockDim.x * blockIdx.x + threadIdx.x;
+	int end = x.rowOffsets[permI + 1];
+	while (j < end)
+	{
+		vec[dim_aligned * blockIdx.y + x.colInd[j]] = x.values[j];
+		j += gridDim.x * blockDim.x;
+	}
+}
+
 template<unsigned int WS, unsigned int TILE>
 __global__ static void kernelCopyXTileT(float * xTile, const float * x, const int * KCacheRowIdx, size_t dim, size_t dim_aligned, size_t num_vec, size_t num_vec_aligned)
 {
@@ -461,28 +479,88 @@ __global__ static void kernelCalcCacheSparse(float * K, int * d_KCacheRowIdx, jd
                 int i = x.colStart[d] + r;
                 sum += vec[dim_aligned * blockIdx.y + x.colInd[i]] * x.values[i];
             }
+#ifdef JDS_PERMK
+			sum = x2i + d_x2[r] - 2 * sum;
+			K[(size_t)num_vec_aligned * row + r] = expf(-gamma * sum);
+#else
             sum = x2i + d_x2[x.rowPerm[r]] - 2 * sum;
             K[(size_t)num_vec_aligned * row + x.rowPerm[r]] = expf(-gamma * sum);
+#endif
         }
         block += gridDim.x * blockDim.x;
     }
 }
 
+__global__ static void kernelCalcCacheSparse(float * K, int * d_KCacheRowIdx, ellrt_gpu x, const float * d_x2, const float * vec, float gamma, int num_vec, int num_vec_aligned, int dim, int dim_aligned)
+{
+	extern __shared__ float shSum[];
+	if (d_num_cache_rows_to_compute <= blockIdx.y)
+		return;
+	int row = d_cache_rows_to_compute[blockIdx.y];
+	int i = d_KCacheRowIdx[row];
+	float x2i = d_x2[i];
+
+	//int k = blockDim.y * blockIdx.x + threadIdx.y;
+	int block = blockDim.y * blockIdx.x;
+	while (block < num_vec)
+	{
+		int r = block + threadIdx.y;
+		float sum = 0;
+		if (r < num_vec)
+		{
+			int sliceNum = r / x.sliceSize;
+			int sliceRow = r % x.sliceSize;
+			int threadStart = x.sliceStart[sliceNum] + blockDim.x * sliceRow;
+			int rowLen = x.rowLen[r];
+			for (int b = 0; blockDim.x * b < rowLen; b++)
+			{
+				int d = threadStart + blockDim.x * x.sliceSize * b + threadIdx.x;
+				sum += vec[dim_aligned * blockIdx.y + x.colInd[d]] * x.values[d];
+			}
+		}
+		shSum[blockDim.x * threadIdx.y + threadIdx.x] = sum;
+		__syncthreads();
+		blockReduceSum(shSum + blockDim.x * threadIdx.y);
+		if (r < num_vec)
+		{
+			if (threadIdx.x == 0)
+			{
+				sum = x2i + d_x2[r] - 2 * shSum[blockDim.x * threadIdx.y];
+				K[(size_t)num_vec_aligned * row + r] = expf(-gamma * sum);
+			}
+		}
+		block += gridDim.x * blockDim.y;
+	}
+}
+
 template<unsigned int findCacheRowBlockSize, unsigned int WS, unsigned int ELEM_PER_THREAD>
-void checkCache(bool sparse, const int * d_workingset, float * d_x, const float * d_x2, const csr_gpu & csr_data_gpu, const jds_gpu & jds_data_gpu, float * d_K, int * d_KCacheRemapIdx, int * d_KCacheRowIdx, int * d_KCacheRowPriority, float * d_denseVec, int num_vec, int num_vec_aligned, int dim, int dim_aligned, int cache_rows, float gamma)
+void checkCache(bool sparse, const int * d_workingset, float * d_x, const float * d_x2, const csr_gpu & csr_data_gpu, const jds_gpu & jds_data_gpu, const ellrt_gpu & ellrt_data_gpu, float * d_K, int * d_KCacheRemapIdx, int * d_KCacheRowIdx, int * d_KCacheRowPriority, float * d_denseVec, int num_vec, int num_vec_aligned, int dim, int dim_aligned, int cache_rows, float gamma)
 {
     if (ELEM_PER_THREAD > 1)
         kernelFindCacheRowN<findCacheRowBlockSize, WS, ELEM_PER_THREAD><<<1, findCacheRowBlockSize>>>(d_workingset, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, cache_rows);
     else
         kernelFindCacheRow<findCacheRowBlockSize, WS><<<1, findCacheRowBlockSize>>>(d_workingset, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, cache_rows);
-    if (sparse)
-    {
-        assert_cuda(cudaMemset(d_denseVec, 0, dim_aligned * WS * sizeof(float)));
-        dim3 dimBlock(256);
-        dim3 dimGrid(std::min(64, getgriddim<int>(dim, dimBlock.x)), WS);
-        kernelMakeDenseVecWS<WS> << <dimGrid, dimBlock >> >(d_KCacheRowIdx, csr_data_gpu, d_denseVec, dim_aligned);
-        dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.x)), WS);
-		kernelCalcCacheSparse << <dimGrid, dimBlock >> >(d_K, d_KCacheRowIdx, jds_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+	if (sparse)
+	{
+		assert_cuda(cudaMemset(d_denseVec, 0, dim_aligned * WS * sizeof(float)));
+		dim3 dimBlock(256);
+		dim3 dimGrid(std::min(64, getgriddim<int>(dim, dimBlock.x)), WS);
+#ifdef JDS_PERMK
+		kernelMakeDenseVecWSPerm<WS> << <dimGrid, dimBlock >> > (d_KCacheRowIdx, csr_data_gpu, jds_data_gpu.rowPerm, d_denseVec, dim_aligned);
+#else
+		kernelMakeDenseVecWS<WS> << <dimGrid, dimBlock >> > (d_KCacheRowIdx, csr_data_gpu, d_denseVec, dim_aligned);
+#endif
+		if (g_useEllRT)
+		{
+			dimBlock = dim3(ellrt_data_gpu.threadPerRow, 256 / ellrt_data_gpu.threadPerRow);
+			dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.y)), WS);
+			kernelCalcCacheSparse << <dimGrid, dimBlock, dimBlock.x * dimBlock.y * sizeof(float) >> > (d_K, d_KCacheRowIdx, ellrt_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+		}
+		else
+		{
+			dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.x)), WS);
+			kernelCalcCacheSparse << <dimGrid, dimBlock >> > (d_K, d_KCacheRowIdx, jds_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+		}
     }
     else
     {
@@ -496,7 +574,7 @@ void checkCache(bool sparse, const int * d_workingset, float * d_x, const float 
 }
 
 template<unsigned int findCacheRowBlockSize, unsigned int WS, unsigned int ELEM_PER_THREAD>
-void checkCacheKLocal(bool sparse, const int * d_workingset, float * d_x, const float * d_x2, const csr_gpu & csr_data_gpu, const jds_gpu & jds_data_gpu, float * d_K, int * d_KCacheRemapIdx, int * d_KCacheRowIdx, int * d_KCacheRowPriority, float * d_alphadiff, float * d_denseVec, int num_vec, int num_vec_aligned, int dim, int dim_aligned, int cache_rows, float gamma)
+void checkCacheKLocal(bool sparse, const int * d_workingset, float * d_x, const float * d_x2, const csr_gpu & csr_data_gpu, const jds_gpu & jds_data_gpu, const ellrt_gpu & ellrt_data_gpu, float * d_K, int * d_KCacheRemapIdx, int * d_KCacheRowIdx, int * d_KCacheRowPriority, float * d_alphadiff, float * d_denseVec, int num_vec, int num_vec_aligned, int dim, int dim_aligned, int cache_rows, float gamma)
 {
     if (ELEM_PER_THREAD > 1)
         kernelFindCacheRowKLocalN<findCacheRowBlockSize, WS, ELEM_PER_THREAD><<<1, findCacheRowBlockSize>>>(d_workingset, d_KCacheRemapIdx, d_KCacheRowIdx, d_KCacheRowPriority, cache_rows, d_alphadiff);
@@ -508,8 +586,17 @@ void checkCacheKLocal(bool sparse, const int * d_workingset, float * d_x, const 
         dim3 dimBlock(256);
         dim3 dimGrid(std::min(64, getgriddim<int>(dim, dimBlock.x)), WS);
         kernelMakeDenseVecWS<WS> << <dimGrid, dimBlock >> >(d_KCacheRowIdx, csr_data_gpu, d_denseVec, dim_aligned);
-        dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.x)), WS);
-		kernelCalcCacheSparse << <dimGrid, dimBlock >> >(d_K, d_KCacheRowIdx, jds_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+		if (g_useEllRT)
+		{
+			dimBlock = dim3(ellrt_data_gpu.threadPerRow, 256 / ellrt_data_gpu.threadPerRow);
+			dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.y)), WS);
+			kernelCalcCacheSparse << <dimGrid, dimBlock, dimBlock.x * dimBlock.y * sizeof(float) >> > (d_K, d_KCacheRowIdx, ellrt_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+		}
+		else
+		{
+			dimGrid = dim3(std::min(64, getgriddim<int>(num_vec, dimBlock.x)), WS);
+			kernelCalcCacheSparse << <dimGrid, dimBlock >> > (d_K, d_KCacheRowIdx, jds_data_gpu, d_x2, d_denseVec, gamma, num_vec, num_vec_aligned, dim, dim_aligned);
+		}
     }
     else
     {

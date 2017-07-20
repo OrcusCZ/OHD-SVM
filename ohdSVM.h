@@ -29,4 +29,6 @@ namespace ohdSVM
 	/// \return True if training succeeded, otherwise false and alpha buffer is unchanged
     ///////////////////////////////////////////////
     bool Train(float * alpha, float * rho, bool sparse, const Data & x, const float * y, size_t num_vec, size_t num_vec_aligned, size_t dim, size_t dim_aligned, float C, float gamma, float eps, int ws_size = 0);
+
+	void useEllRT(bool use, int sliceSize = 0, int threadsPerRow = 0);
 }

@@ -54,14 +54,43 @@ static __global__ void kernelSumX2Sparse(float * x2, ohdSVM::jds_gpu x, int num_
     for (int k = blockDim.x * blockIdx.x + threadIdx.x; k < num_vec; k += gridDim.x * blockDim.x)
     {
         float sum = 0;
-        int row_len = x.rowLen[k];
-        for (int d = 0; d < row_len; d++)
+        int rowLen = x.rowLen[k];
+        for (int d = 0; d < rowLen; d++)
         {
             float v = x.values[x.colStart[d] + k];
             sum += v * v;
         }
+#ifdef JDS_PERMK
+		x2[k] = sum;
+#else
         x2[x.rowPerm[k]] = sum;
+#endif
     }
+}
+
+static __global__ void kernelSumX2Sparse(float * x2, ohdSVM::ellrt_gpu x, int num_vec)
+{
+	extern __shared__ float shSum[];
+	for (int k = blockDim.y * blockIdx.x + threadIdx.y; k < num_vec; k += gridDim.x * blockDim.y)
+	{
+		int sliceNum = k / x.sliceSize;
+		int sliceRow = k % x.sliceSize;
+		int threadStart = x.sliceStart[sliceNum] + blockDim.x * sliceRow;
+		int rowLen = x.rowLen[k];
+		float sum = 0;
+		for (int b = 0; blockDim.x * b < rowLen; b++)
+		{
+			int d = blockDim.x * x.sliceSize * b + threadIdx.x;
+			float v = x.values[threadStart + d];
+			sum += v * v;
+		}
+		shSum[blockDim.x * threadIdx.y + threadIdx.x] = sum;
+		__syncthreads();
+		blockReduceSum(shSum + blockDim.x * threadIdx.y);
+		if (threadIdx.x == 0)
+			x2[k] = shSum[blockDim.x * threadIdx.y];
+		__syncthreads();
+	}
 }
 
 void ohdSVM::computeX2Dense(float * d_x2, const float * d_x, int num_vec, int num_vec_aligned, int dim, int dim_aligned)
@@ -86,4 +115,10 @@ void ohdSVM::computeX2Sparse(float * d_x2, const jds_gpu & x, int num_vec)
 {
     dim3 dimBlockSumX2(256);
     kernelSumX2Sparse<<<dim3(getgriddim<int>(num_vec, dimBlockSumX2.x)), dimBlockSumX2>>>(d_x2, x, num_vec);
+}
+
+void ohdSVM::computeX2Sparse(float * d_x2, const ellrt_gpu & x, int num_vec)
+{
+	dim3 dimBlockSumX2(x.threadPerRow, 256 / x.threadPerRow);
+	kernelSumX2Sparse<<<dim3(getgriddim<int>(num_vec, dimBlockSumX2.y)), dimBlockSumX2, dimBlockSumX2.x * dimBlockSumX2.y * sizeof(float)>>>(d_x2, x, num_vec);
 }

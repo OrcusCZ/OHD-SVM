@@ -106,6 +106,41 @@ __global__ static void kernelCalcKLocalSparse(float * KLocal, const float * K, c
     }
 }
 
+template<int WS, int NUM_WARPS>
+__global__ static void kernelCalcKLocalSparsePerm(float * KLocal, const float * K, const int * KCacheRemapIdx, csr_gpu x, const unsigned int * rowPerm, const float * d_x2, const float * vec, const int * ws, float gamma, int num_vec, int num_vec_aligned, int dim, int dim_aligned)
+{
+	int ws_idx = ws[blockIdx.y];
+	int cache_row = KCacheRemapIdx[ws_idx];
+
+	int block = NUM_WARPS * blockIdx.x;
+	int j = block + threadIdx.y;
+	int ws_idxJ = ws[j];
+	int permJ = rowPerm[ws_idxJ];
+	float sum = 0;
+	if (cache_row < 0)
+	{
+		int end = x.rowOffsets[permJ] + x.rowLen[permJ];
+		for (int d = x.rowOffsets[permJ] + threadIdx.x; d < end; d += warpSize)
+		{
+			sum += vec[dim_aligned * blockIdx.y + x.colInd[d]] * x.values[d];
+		}
+	}
+	sum = warpReduceSum(sum);
+	if (cache_row >= 0)
+	{
+		if (threadIdx.x < NUM_WARPS && threadIdx.y == 0)
+			KLocal[WS * blockIdx.y + block + threadIdx.x] = K[(size_t)num_vec_aligned * cache_row + ws[block + threadIdx.x]];
+	}
+	else
+	{
+		if (threadIdx.x == 0)
+		{
+			sum = d_x2[rowPerm[ws_idx]] + d_x2[permJ] - 2 * sum;
+			KLocal[WS * blockIdx.y + j] = expf(-gamma * sum);
+		}
+	}
+}
+
 template<unsigned int WS>
 __global__ static void kernelCopyKToLocal(const int * ws, const float * K, float * KLocal, int * KCacheRemapIdx, int num_vec_aligned)
 {
